@@ -689,38 +689,133 @@ async def process_pdf_files() -> list:
     
     all_raw_tables = []  # Store all raw tables
     
+    # Helper function from get_pdf_metadata for better header detection
+    def looks_like_header(row):
+        """Heuristic: mostly non-empty strings, not numbers; short-ish cells."""
+        if not row or not isinstance(row, list):
+            return False
+        str_like = sum(1 for c in row if isinstance(c, str) and bool(re.search(r"[A-Za-z]", c or "")))
+        num_like = sum(1 for c in row if isinstance(c, str) and re.fullmatch(r"[-+]?[\d,.]+", (c or "").strip()))
+        avg_len = sum(len((c or "")) for c in row) / max(len(row), 1)
+        return (str_like >= max(1, len(row)//2)) and (num_like <= len(row)//3) and (avg_len <= 40)
+    
     # First pass: Extract ALL raw tables from ALL PDFs (no processing at all)
     print("🔄 Phase 1: Extracting raw tables from all PDFs...")
     for i, pdf_file in enumerate(pdf_files):
         try:
             print(f"📄 Processing PDF {i+1}/{len(pdf_files)}: {pdf_file}")
             
-            # Extract all tables from PDF using tabula
+            # Extract all tables from PDF using pdfplumber with enhanced settings
             try:
-                # Extract tables with various configurations to catch different table formats
-                tables = tabula.read_pdf(
-                    pdf_file, 
-                    pages='all', 
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,  # For tables with clear borders
-                    silent=True
-                )
+                import pdfplumber
+                tables = []
+                header_candidates = []  # Track potential headers across pages
                 
-                # If lattice method didn't work well, try stream method
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
-                    tables = tabula.read_pdf(
-                        pdf_file, 
-                        pages='all', 
-                        multiple_tables=True,
-                        pandas_options={'header': 'infer'},
-                        stream=True,  # For tables without clear borders
-                        silent=True
-                    )
+                with pdfplumber.open(pdf_file) as pdf:
+                    total_pages = len(pdf.pages)
+                    print(f"   📑 PDF has {total_pages} pages")
+                    
+                    for page_num, page in enumerate(pdf.pages):
+                        # Extract tables from current page with improved settings
+                        page_tables = page.extract_tables(
+                            table_settings={
+                                "vertical_strategy": "lines",
+                                "horizontal_strategy": "lines", 
+                                "intersection_tolerance": 5,
+                                "snap_tolerance": 3,
+                                "join_tolerance": 3
+                            }
+                        )
+                        
+                        if page_tables:
+                            for table_idx, table in enumerate(page_tables):
+                                if table and len(table) > 0:
+                                    # Enhanced header detection
+                                    first_row = table[0] if table else None
+                                    has_smart_header = looks_like_header(first_row) if first_row else False
+                                    
+                                    if has_smart_header and first_row:
+                                        # Track this header pattern
+                                        header_tuple = tuple((c or "").strip() for c in first_row)
+                                        header_candidates.append(header_tuple)
+                                        
+                                        # Use first row as headers, rest as data
+                                        headers = [str((c or "")).strip() for c in first_row]
+                                        rows = table[1:] if len(table) > 1 else []
+                                    else:
+                                        # No clear header detected, use generic column names
+                                        max_cols = max(len(row) for row in table) if table else 0
+                                        headers = [f"column_{j+1}" for j in range(max_cols)]
+                                        rows = table
+                                    
+                                    # Create DataFrame with better error handling
+                                    try:
+                                        if rows:  # Only if we have data rows
+                                            # Ensure all rows have same length as headers
+                                            normalized_rows = []
+                                            for row in rows:
+                                                normalized_row = []
+                                                for j in range(len(headers)):
+                                                    if j < len(row):
+                                                        normalized_row.append(row[j])
+                                                    else:
+                                                        normalized_row.append(None)
+                                                normalized_rows.append(normalized_row)
+                                            
+                                            df = pd.DataFrame(normalized_rows, columns=headers)
+                                            # Remove completely empty rows
+                                            df = df.dropna(how='all')
+                                            
+                                            if not df.empty:
+                                                tables.append(df)
+                                                header_info = "✓ Smart header" if has_smart_header else "⚡ Generic header"
+                                                print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols ({header_info})")
+                                    except Exception as df_error:
+                                        print(f"   ⚠️ Failed to create DataFrame for page {page_num + 1}, table {table_idx + 1}: {df_error}")
                 
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file}: {tabula_error}")
+                # Check for consistent headers across pages (enhanced feature)
+                if header_candidates:
+                    from collections import Counter
+                    header_counter = Counter(header_candidates)
+                    if header_counter:
+                        most_common_header, frequency = header_counter.most_common(1)[0]
+                        if frequency >= 2:
+                            print(f"   🔄 Found repeating header pattern across {frequency} tables: {list(most_common_header)[:3]}...")
+                
+                # If no tables found with default settings, try with more lenient settings
+                if not tables:
+                    print("📄 Retrying with more lenient table detection settings...")
+                    with pdfplumber.open(pdf_file) as pdf:
+                        for page_num, page in enumerate(pdf.pages):
+                            # Try with more aggressive table detection
+                            page_tables = page.extract_tables(table_settings={
+                                "vertical_strategy": "text",  # More lenient
+                                "horizontal_strategy": "text",
+                                "snap_tolerance": 5,
+                                "join_tolerance": 5,
+                                "edge_min_length": 3
+                            })
+                            
+                            if page_tables:
+                                for table_idx, table in enumerate(page_tables):
+                                    if table and len(table) > 1:
+                                        # Use first row as headers for fallback method
+                                        headers = [f"col_{j}" if not table[0][j] else str(table[0][j]).strip() 
+                                                 for j in range(len(table[0]))]
+                                        rows = table[1:]
+                                        
+                                        try:
+                                            df = pd.DataFrame(rows, columns=headers)
+                                            df = df.dropna(how='all')
+                                            
+                                            if not df.empty:
+                                                tables.append(df)
+                                                print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols (fallback)")
+                                        except Exception as df_error:
+                                            print(f"   ⚠️ Fallback failed for page {page_num + 1}, table {table_idx + 1}: {df_error}")
+                
+            except Exception as pdfplumber_error:
+                print(f"❌ pdfplumber extraction failed for {pdf_file}: {pdfplumber_error}")
                 continue
             
             if not tables:
@@ -729,7 +824,7 @@ async def process_pdf_files() -> list:
             
             print(f"📊 Found {len(tables)} raw tables in {pdf_file}")
             
-            # Store all raw tables with metadata (NO PROCESSING)
+            # Store all raw tables with metadata (NO PROCESSING) - Enhanced with metadata
             for j, raw_df in enumerate(tables):
                 if raw_df.empty:
                     print(f"⚠️ Table {j+1} is empty, skipping")
@@ -739,7 +834,10 @@ async def process_pdf_files() -> list:
                     "raw_dataframe": raw_df,
                     "source_pdf": pdf_file,
                     "table_number": j + 1,
-                    "raw_columns": list(raw_df.columns)
+                    "raw_columns": list(raw_df.columns),
+                    "estimated_rows": len(raw_df),  # Enhanced: add row count
+                    "has_smart_headers": any(col.replace('_', ' ').replace('-', ' ').strip() 
+                                           for col in raw_df.columns if not col.startswith('column_'))  # Enhanced: header quality indicator
                 }
                 
                 all_raw_tables.append(table_metadata)
@@ -755,7 +853,7 @@ async def process_pdf_files() -> list:
     
     print(f"📊 Phase 1 complete: {len(all_raw_tables)} raw tables extracted")
     
-    # Second pass: Group raw tables by similar headers
+    # Second pass: Group raw tables by similar headers (UNCHANGED)
     print("\n🔄 Phase 2: Grouping tables with similar headers...")
     combined_data_groups = {}
     
@@ -792,7 +890,7 @@ async def process_pdf_files() -> list:
         for table in group_data['raw_tables']:
             print(f"      - {table['source_pdf']} (table {table['table_number']})")
     
-    # Third pass: Simply merge tables and save (NO data_scrape processing)
+    # Third pass: Simply merge tables and save (UNCHANGED but with enhanced metadata)
     print("\n🔄 Phase 3: Merging grouped tables and saving...")
     
     for group_name, group_data in combined_data_groups.items():
@@ -804,6 +902,7 @@ async def process_pdf_files() -> list:
         # Merge all raw tables in this group
         combined_raw_dfs = []
         source_pdfs = []
+        total_estimated_rows = 0  # Enhanced: track total rows
         
         for table_meta in raw_tables_in_group:
             raw_df = table_meta["raw_dataframe"].copy()  # Make a copy to avoid modifying original
@@ -819,6 +918,7 @@ async def process_pdf_files() -> list:
             
             combined_raw_dfs.append(raw_df)
             source_pdfs.append(table_meta["source_pdf"])
+            total_estimated_rows += table_meta.get("estimated_rows", len(raw_df))  # Enhanced
             print(f"   ✅ Added {raw_df.shape[0]} rows from {table_meta['source_pdf']}")
         
         # Combine all raw DataFrames
@@ -841,6 +941,7 @@ async def process_pdf_files() -> list:
             # Save the merged data directly (no processing)
             merged_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
             
+            # Enhanced metadata
             table_info = {
                 "filename": f"/tmp/{csv_filename}",
                 "source_pdfs": list(set(source_pdfs)),
@@ -849,7 +950,9 @@ async def process_pdf_files() -> list:
                 "columns": list(merged_df.columns),
                 "sample_data": merged_df.head(3).to_dict('records'),
                 "description": f"Combined raw table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
-                "formatting_applied": "None - raw data preserved"
+                "formatting_applied": "None - raw data preserved",
+                "extraction_method": "pdfplumber with smart header detection",  # Enhanced
+                "estimated_total_rows": total_estimated_rows  # Enhanced
             }
             
             pdf_data.append(table_info)
@@ -859,7 +962,7 @@ async def process_pdf_files() -> list:
             
         except Exception as merge_error:
             print(f"❌ Error merging group {group_name}: {merge_error}")
-            # Fallback: save individual tables
+            # Fallback: save individual tables (UNCHANGED)
             for idx, table_meta in enumerate(raw_tables_in_group):
                 raw_df = table_meta["raw_dataframe"]
                 csv_filename = f"fallback_{group_name}_table_{idx+1}.csv"
