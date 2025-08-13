@@ -85,6 +85,7 @@ horizon_api = os.getenv("horizon_api")
 gemini_api_2 = os.getenv("gemini_api_2")
 grok_api = os.getenv("grok_api")
 grok_fix_api = os.getenv("grok_fix_api")
+anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 
 def make_json_serializable(obj):
     """Convert pandas/numpy objects to JSON-serializable formats"""
