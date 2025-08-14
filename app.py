@@ -31,7 +31,7 @@ app = FastAPI()
 load_dotenv()
 
 # --- Precise file tracking & cleanup helpers ---
-def _snapshot_files(root: str = "/tmp") -> set[str]:
+def _snapshot_files(root: str = ".") -> set[str]:
     """Get a snapshot of all files under root as relative paths."""
     files = set()
     for dirpath, dirnames, filenames in os.walk(root):
@@ -53,7 +53,7 @@ def _cleanup_created_files(files_to_delete: set[str]) -> int:
             path = os.path.normpath(rel_path)
             # handle paths that might already be absolute
             if not os.path.isabs(path):
-                path = os.path.join("/tmp", path) if path != "/tmp" else "/tmp"
+                path = os.path.join(".", path) if path != "." else "."
             if os.path.isfile(path):
                 os.remove(path)
                 deleted += 1
@@ -85,7 +85,8 @@ horizon_api = os.getenv("horizon_api")
 gemini_api_2 = os.getenv("gemini_api_2")
 grok_api = os.getenv("grok_api")
 grok_fix_api = os.getenv("grok_fix_api")
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+openai_gpt5_api_key = os.getenv("OPENAI_GPT5_API_KEY")
+openai_gpt5_url = "https://api.openai.com/v1/chat/completions"
 
 def make_json_serializable(obj):
     """Convert pandas/numpy objects to JSON-serializable formats"""
@@ -229,7 +230,7 @@ async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> di
 @functools.lru_cache(maxsize=10)
 def read_prompt_file(filename: str, default: str = "") -> str:
     try:
-        with open(os.path.join("/app", filename), encoding="utf-8") as f:
+        with open(filename, encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         print(f"⚠️ Prompt file not found: {filename}. Using default content.")
@@ -295,77 +296,6 @@ async def ping_chatgpt(question_text, relevant_context, max_tries=3):
             tries += 1
             continue
 
-async def ping_claude(question_text, relevant_context="", max_tries=3):
-    """Call Claude API with proper error handling and response parsing."""
-    tries = 0
-    while tries < max_tries:
-        try:
-            print(f"claude is running {tries + 1} try")
-            
-            # Check if API key is available
-            if not anthropic_api_key:
-                print("❌ anthropic_api_key is not set")
-                return {"error": "ANTHROPIC_API_KEY not configured"}
-            
-            headers = {
-                "x-api-key": anthropic_api_key,  # Use the variable defined at module level
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            }
-            
-            # Prepare the message content
-            if relevant_context:
-                content = f"{relevant_context}\n\n{question_text}"
-            else:
-                content = question_text
-                
-            payload = {
-                "model": "claude-3-5-sonnet-20241022",
-                "max_tokens": 4096,
-                "messages": [
-                    {"role": "user", "content": content}
-                ]
-            }
-            
-            async with httpx.AsyncClient(timeout=120) as client:
-                response = await client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers=headers,
-                    json=payload
-                )
-                response.raise_for_status()
-                
-                # Parse and validate response
-                result = response.json()
-                
-                # More thorough response validation
-                if (isinstance(result, dict) and 
-                    "content" in result and 
-                    isinstance(result["content"], list) and 
-                    len(result["content"]) > 0 and
-                    isinstance(result["content"][0], dict) and
-                    "text" in result["content"][0]):
-                    return result
-                else:
-                    print(f"⚠️ Unexpected response structure: {result}")
-                    tries += 1
-                    if tries >= max_tries:
-                        return {"error": f"Invalid response structure after {max_tries} tries"}
-                    continue
-                    
-        except httpx.TimeoutException:
-            print(f"⏰ Claude API timeout on try {tries + 1}")
-            tries += 1
-        except httpx.HTTPStatusError as e:
-            print(f"🚫 Claude API HTTP error {e.response.status_code} on try {tries + 1}")
-            # Avoid printing potentially large response text
-            tries += 1
-        except Exception as e:
-            print(f"❌ Error during Claude call on try {tries + 1}: {e}")
-            tries += 1
-            
-    return {"error": "Claude failed after max retries"}
-
 
 async def ping_horizon(question_text, relevant_context="", max_tries=3):
     tries = 0
@@ -422,7 +352,7 @@ async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
                     }
                 ]
             }
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=200) as client:
                 response = await client.post("https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent", headers=headers, json=payload)
                 print(response)
                 
@@ -446,6 +376,47 @@ async def ping_gemini_pro(question_text, relevant_context="", max_tries=3):
             else:
                 print(f"All {max_tries} attempts failed for Gemini Pro")
                 return {"error": f"Failed after {max_tries} attempts: {str(e)}"}
+
+
+async def ping_open_ai_5(question_text, relevant_context="", max_tries=3):
+    """Call OpenAI GPT-5 API for advanced AI responses with ChatGPT fallback."""
+    tries = 0
+    while tries < max_tries:
+        try:
+            print(f"OpenAI GPT-5 is running {tries+1} try")
+            headers = {
+                "Authorization": f"Bearer {openai_gpt5_api_key}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "gpt-5-2025-08-07",  # Update this when GPT-5 is available
+                "messages": [
+                    {"role": "system", "content": relevant_context},
+                    {"role": "user", "content": question_text}
+                ]
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                response = await client.post(openai_gpt5_url, headers=headers, json=payload)
+                
+                # Check if response is successful
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    print(f"OpenAI GPT-5 API error: {response.status_code} - {response.text}")
+                    if response.status_code >= 500:  # Server errors, retry
+                        raise Exception(f"Server error {response.status_code}: {response.text}")
+                    else:  # Client errors, don't retry but fallback to ChatGPT
+                        print(f"OpenAI GPT-5 client error, falling back to ChatGPT...")
+                        return await ping_chatgpt(question_text, relevant_context)
+                        
+        except Exception as e:
+            print(f"Error in OpenAI GPT-5 API call (attempt {tries + 1}): {e}")
+            tries += 1
+            if tries < max_tries:
+                print(f"Retrying... ({max_tries - tries} attempts remaining)")
+            else:
+                print(f"All {max_tries} attempts failed for OpenAI GPT-5, falling back to ChatGPT...")
+                return await ping_chatgpt(question_text, relevant_context)
 
 
 
@@ -627,10 +598,13 @@ def extract_urls_with_regex(question_text: str) -> dict:
         "has_data_sources": len(scrape_urls) > 0 or len(database_files) > 0
     }
 
-async def scrape_all_urls(urls: list) -> list:
+async def scrape_all_urls(urls: list, created_files: set = None) -> list:
     """Scrape all URLs and save as data1.csv, data2.csv, etc."""
     scraped_data = []
     sourcer = data_scrape.ImprovedWebScraper()
+    
+    if created_files is None:
+        created_files = set()
     
     for i, url in enumerate(urls):
         try:
@@ -667,10 +641,11 @@ async def scrape_all_urls(urls: list) -> list:
                         else:  # Subsequent URLs
                             filename = f"{safe_table_name}_url{i+1}_{j+1}.csv"
                         
-                        df.to_csv(f"/tmp/{filename}", index=False, encoding="utf-8")
+                        df.to_csv(filename, index=False, encoding="utf-8")
+                        created_files.add(os.path.normpath(filename))
                         
                         scraped_data.append({
-                            "filename": f"/tmp/{filename}",
+                            "filename": filename,
                             "source_url": url,
                             "table_name": table_name,
                             "shape": table_data["shape"],
@@ -686,10 +661,11 @@ async def scrape_all_urls(urls: list) -> list:
                 
                 if not df.empty:
                     filename = f"data{i+1}.csv" if i > 0 else "data.csv"
-                    df.to_csv(f"/tmp/{filename}", index=False, encoding="utf-8")
+                    df.to_csv(filename, index=False, encoding="utf-8")
+                    created_files.add(os.path.normpath(filename))
                     
                     scraped_data.append({
-                        "filename": f"/tmp/{filename}",
+                        "filename": filename,
                         "source_url": url,
                         "shape": df.shape,
                         "columns": list(df.columns)
@@ -752,7 +728,7 @@ async def process_pdf_files() -> list:
     pdf_data = []
     
     # Find all PDF files in current directory
-    pdf_files = glob.glob("/tmp/*.pdf")
+    pdf_files = glob.glob("*.pdf")
     if not pdf_files:
         print("📄 No PDF files found in current directory")
         return pdf_data
@@ -761,133 +737,38 @@ async def process_pdf_files() -> list:
     
     all_raw_tables = []  # Store all raw tables
     
-    # Helper function from get_pdf_metadata for better header detection
-    def looks_like_header(row):
-        """Heuristic: mostly non-empty strings, not numbers; short-ish cells."""
-        if not row or not isinstance(row, list):
-            return False
-        str_like = sum(1 for c in row if isinstance(c, str) and bool(re.search(r"[A-Za-z]", c or "")))
-        num_like = sum(1 for c in row if isinstance(c, str) and re.fullmatch(r"[-+]?[\d,.]+", (c or "").strip()))
-        avg_len = sum(len((c or "")) for c in row) / max(len(row), 1)
-        return (str_like >= max(1, len(row)//2)) and (num_like <= len(row)//3) and (avg_len <= 40)
-    
     # First pass: Extract ALL raw tables from ALL PDFs (no processing at all)
     print("🔄 Phase 1: Extracting raw tables from all PDFs...")
     for i, pdf_file in enumerate(pdf_files):
         try:
             print(f"📄 Processing PDF {i+1}/{len(pdf_files)}: {pdf_file}")
             
-            # Extract all tables from PDF using pdfplumber with enhanced settings
+            # Extract all tables from PDF using tabula
             try:
-                import pdfplumber
-                tables = []
-                header_candidates = []  # Track potential headers across pages
+                # Extract tables with various configurations to catch different table formats
+                tables = tabula.read_pdf(
+                    pdf_file, 
+                    pages='all', 
+                    multiple_tables=True,
+                    pandas_options={'header': 'infer'},
+                    lattice=True,  # For tables with clear borders
+                    silent=True
+                )
                 
-                with pdfplumber.open(pdf_file) as pdf:
-                    total_pages = len(pdf.pages)
-                    print(f"   📑 PDF has {total_pages} pages")
-                    
-                    for page_num, page in enumerate(pdf.pages):
-                        # Extract tables from current page with improved settings
-                        page_tables = page.extract_tables(
-                            table_settings={
-                                "vertical_strategy": "lines",
-                                "horizontal_strategy": "lines", 
-                                "intersection_tolerance": 5,
-                                "snap_tolerance": 3,
-                                "join_tolerance": 3
-                            }
-                        )
-                        
-                        if page_tables:
-                            for table_idx, table in enumerate(page_tables):
-                                if table and len(table) > 0:
-                                    # Enhanced header detection
-                                    first_row = table[0] if table else None
-                                    has_smart_header = looks_like_header(first_row) if first_row else False
-                                    
-                                    if has_smart_header and first_row:
-                                        # Track this header pattern
-                                        header_tuple = tuple((c or "").strip() for c in first_row)
-                                        header_candidates.append(header_tuple)
-                                        
-                                        # Use first row as headers, rest as data
-                                        headers = [str((c or "")).strip() for c in first_row]
-                                        rows = table[1:] if len(table) > 1 else []
-                                    else:
-                                        # No clear header detected, use generic column names
-                                        max_cols = max(len(row) for row in table) if table else 0
-                                        headers = [f"column_{j+1}" for j in range(max_cols)]
-                                        rows = table
-                                    
-                                    # Create DataFrame with better error handling
-                                    try:
-                                        if rows:  # Only if we have data rows
-                                            # Ensure all rows have same length as headers
-                                            normalized_rows = []
-                                            for row in rows:
-                                                normalized_row = []
-                                                for j in range(len(headers)):
-                                                    if j < len(row):
-                                                        normalized_row.append(row[j])
-                                                    else:
-                                                        normalized_row.append(None)
-                                                normalized_rows.append(normalized_row)
-                                            
-                                            df = pd.DataFrame(normalized_rows, columns=headers)
-                                            # Remove completely empty rows
-                                            df = df.dropna(how='all')
-                                            
-                                            if not df.empty:
-                                                tables.append(df)
-                                                header_info = "✓ Smart header" if has_smart_header else "⚡ Generic header"
-                                                print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols ({header_info})")
-                                    except Exception as df_error:
-                                        print(f"   ⚠️ Failed to create DataFrame for page {page_num + 1}, table {table_idx + 1}: {df_error}")
+                # If lattice method didn't work well, try stream method
+                if not tables or all(df.empty for df in tables):
+                    print("📄 Retrying with stream method...")
+                    tables = tabula.read_pdf(
+                        pdf_file, 
+                        pages='all', 
+                        multiple_tables=True,
+                        pandas_options={'header': 'infer'},
+                        stream=True,  # For tables without clear borders
+                        silent=True
+                    )
                 
-                # Check for consistent headers across pages (enhanced feature)
-                if header_candidates:
-                    from collections import Counter
-                    header_counter = Counter(header_candidates)
-                    if header_counter:
-                        most_common_header, frequency = header_counter.most_common(1)[0]
-                        if frequency >= 2:
-                            print(f"   🔄 Found repeating header pattern across {frequency} tables: {list(most_common_header)[:3]}...")
-                
-                # If no tables found with default settings, try with more lenient settings
-                if not tables:
-                    print("📄 Retrying with more lenient table detection settings...")
-                    with pdfplumber.open(pdf_file) as pdf:
-                        for page_num, page in enumerate(pdf.pages):
-                            # Try with more aggressive table detection
-                            page_tables = page.extract_tables(table_settings={
-                                "vertical_strategy": "text",  # More lenient
-                                "horizontal_strategy": "text",
-                                "snap_tolerance": 5,
-                                "join_tolerance": 5,
-                                "edge_min_length": 3
-                            })
-                            
-                            if page_tables:
-                                for table_idx, table in enumerate(page_tables):
-                                    if table and len(table) > 1:
-                                        # Use first row as headers for fallback method
-                                        headers = [f"col_{j}" if not table[0][j] else str(table[0][j]).strip() 
-                                                 for j in range(len(table[0]))]
-                                        rows = table[1:]
-                                        
-                                        try:
-                                            df = pd.DataFrame(rows, columns=headers)
-                                            df = df.dropna(how='all')
-                                            
-                                            if not df.empty:
-                                                tables.append(df)
-                                                print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols (fallback)")
-                                        except Exception as df_error:
-                                            print(f"   ⚠️ Fallback failed for page {page_num + 1}, table {table_idx + 1}: {df_error}")
-                
-            except Exception as pdfplumber_error:
-                print(f"❌ pdfplumber extraction failed for {pdf_file}: {pdfplumber_error}")
+            except Exception as tabula_error:
+                print(f"❌ Tabula extraction failed for {pdf_file}: {tabula_error}")
                 continue
             
             if not tables:
@@ -896,7 +777,7 @@ async def process_pdf_files() -> list:
             
             print(f"📊 Found {len(tables)} raw tables in {pdf_file}")
             
-            # Store all raw tables with metadata (NO PROCESSING) - Enhanced with metadata
+            # Store all raw tables with metadata (NO PROCESSING)
             for j, raw_df in enumerate(tables):
                 if raw_df.empty:
                     print(f"⚠️ Table {j+1} is empty, skipping")
@@ -906,10 +787,7 @@ async def process_pdf_files() -> list:
                     "raw_dataframe": raw_df,
                     "source_pdf": pdf_file,
                     "table_number": j + 1,
-                    "raw_columns": list(raw_df.columns),
-                    "estimated_rows": len(raw_df),  # Enhanced: add row count
-                    "has_smart_headers": any(col.replace('_', ' ').replace('-', ' ').strip() 
-                                           for col in raw_df.columns if not col.startswith('column_'))  # Enhanced: header quality indicator
+                    "raw_columns": list(raw_df.columns)
                 }
                 
                 all_raw_tables.append(table_metadata)
@@ -925,7 +803,7 @@ async def process_pdf_files() -> list:
     
     print(f"📊 Phase 1 complete: {len(all_raw_tables)} raw tables extracted")
     
-    # Second pass: Group raw tables by similar headers (UNCHANGED)
+    # Second pass: Group raw tables by similar headers
     print("\n🔄 Phase 2: Grouping tables with similar headers...")
     combined_data_groups = {}
     
@@ -962,7 +840,7 @@ async def process_pdf_files() -> list:
         for table in group_data['raw_tables']:
             print(f"      - {table['source_pdf']} (table {table['table_number']})")
     
-    # Third pass: Simply merge tables and save (UNCHANGED but with enhanced metadata)
+    # Third pass: Simply merge tables and save (NO data_scrape processing)
     print("\n🔄 Phase 3: Merging grouped tables and saving...")
     
     for group_name, group_data in combined_data_groups.items():
@@ -974,7 +852,6 @@ async def process_pdf_files() -> list:
         # Merge all raw tables in this group
         combined_raw_dfs = []
         source_pdfs = []
-        total_estimated_rows = 0  # Enhanced: track total rows
         
         for table_meta in raw_tables_in_group:
             raw_df = table_meta["raw_dataframe"].copy()  # Make a copy to avoid modifying original
@@ -990,7 +867,6 @@ async def process_pdf_files() -> list:
             
             combined_raw_dfs.append(raw_df)
             source_pdfs.append(table_meta["source_pdf"])
-            total_estimated_rows += table_meta.get("estimated_rows", len(raw_df))  # Enhanced
             print(f"   ✅ Added {raw_df.shape[0]} rows from {table_meta['source_pdf']}")
         
         # Combine all raw DataFrames
@@ -1011,20 +887,17 @@ async def process_pdf_files() -> list:
                 csv_filename = f"combined_{clean_name[:20]}.csv"
             
             # Save the merged data directly (no processing)
-            merged_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
+            merged_df.to_csv(csv_filename, index=False, encoding="utf-8")
             
-            # Enhanced metadata
             table_info = {
-                "filename": f"/tmp/{csv_filename}",
+                "filename": csv_filename,
                 "source_pdfs": list(set(source_pdfs)),
                 "table_count": len(raw_tables_in_group),
                 "shape": merged_df.shape,
                 "columns": list(merged_df.columns),
                 "sample_data": merged_df.head(3).to_dict('records'),
                 "description": f"Combined raw table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
-                "formatting_applied": "None - raw data preserved",
-                "extraction_method": "pdfplumber with smart header detection",  # Enhanced
-                "estimated_total_rows": total_estimated_rows  # Enhanced
+                "formatting_applied": "None - raw data preserved"
             }
             
             pdf_data.append(table_info)
@@ -1034,14 +907,14 @@ async def process_pdf_files() -> list:
             
         except Exception as merge_error:
             print(f"❌ Error merging group {group_name}: {merge_error}")
-            # Fallback: save individual tables (UNCHANGED)
+            # Fallback: save individual tables
             for idx, table_meta in enumerate(raw_tables_in_group):
                 raw_df = table_meta["raw_dataframe"]
                 csv_filename = f"fallback_{group_name}_table_{idx+1}.csv"
-                raw_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
+                raw_df.to_csv(csv_filename, index=False, encoding="utf-8")
                 
                 table_info = {
-                    "filename": f"/tmp/{csv_filename}",
+                    "filename": csv_filename,
                     "source_pdfs": [table_meta["source_pdf"]],
                     "table_count": 1,
                     "shape": raw_df.shape,
@@ -1238,7 +1111,7 @@ async def aianalyst(request: Request):
  
     time_start = time.time()
     # Track files created during this request
-    initial_snapshot = _snapshot_files("/tmp")
+    initial_snapshot = _snapshot_files(".")
     created_files: set[str] = set()
     
     # Initialize file type variables
@@ -1346,7 +1219,7 @@ async def aianalyst(request: Request):
     
     if archive_files:
         # Create a temporary directory for extraction
-        temp_dir = tempfile.mkdtemp(prefix="archive_extract_", dir="/tmp")
+        temp_dir = tempfile.mkdtemp(prefix="archive_extract_", dir=".")
         created_files.add(temp_dir)  # Track for cleanup
         
         try:
@@ -1430,9 +1303,9 @@ async def aianalyst(request: Request):
         task_breaked = gemini_response["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         task_breaked = f"1. Read question (Task breaker fallback due to error: {e})"  # fallback minimal content
-    with open("/tmp/broken_down_tasks.txt", "w", encoding="utf-8") as f:
+    with open("broken_down_tasks.txt", "w", encoding="utf-8") as f:
         f.write(str(task_breaked))
-    created_files.add(os.path.normpath("/tmp/broken_down_tasks.txt"))
+    created_files.add(os.path.normpath("broken_down_tasks.txt"))
 
     # Proceed with remaining steps (CSV/HTML/JSON processing, source extraction, etc.)
     # ----------------------------------------------------------------------
@@ -1449,12 +1322,12 @@ async def aianalyst(request: Request):
             cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(csv_df)
             
             # Save as ProvidedCSV.csv
-            cleaned_df.to_csv("/tmp/ProvidedCSV.csv", index=False, encoding="utf-8")
-            created_files.add(os.path.normpath("/tmp/ProvidedCSV.csv"))
+            cleaned_df.to_csv("ProvidedCSV.csv", index=False, encoding="utf-8")
+            created_files.add(os.path.normpath("ProvidedCSV.csv"))
 
             
             provided_csv_info = {
-                "filename": "/tmp/ProvidedCSV.csv",
+                "filename": "ProvidedCSV.csv",
                 "shape": cleaned_df.shape,
                 "columns": list(cleaned_df.columns),
                 "sample_data": cleaned_df.head(3).to_dict('records'),
@@ -1480,11 +1353,11 @@ async def aianalyst(request: Request):
             
             # Save with unique name
             output_name = f"ExtractedCSV_{i+1}.csv"
-            cleaned_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
-            created_files.add(os.path.normpath(f"/tmp/{output_name}"))
+            cleaned_df.to_csv(output_name, index=False, encoding="utf-8")
+            created_files.add(os.path.normpath(output_name))
 
             csv_info = {
-                "filename": f"/tmp/{output_name}",
+                "filename": output_name,
                 "shape": cleaned_df.shape,
                 "columns": list(cleaned_df.columns),
                 "sample_data": cleaned_df.head(3).to_dict('records'),
@@ -1510,11 +1383,11 @@ async def aianalyst(request: Request):
             if df_html is not None and not df_html.empty:
                 cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
                 html_csv_name = "ProvidedHTML.csv"
-                cleaned_html_df.to_csv(f"/tmp/{html_csv_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{html_csv_name}"))
+                cleaned_html_df.to_csv(html_csv_name, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(html_csv_name))
 
                 provided_html_info = {
-                    "filename": f"/tmp/{html_csv_name}",
+                    "filename": html_csv_name,
                     "shape": cleaned_html_df.shape,
                     "columns": list(cleaned_html_df.columns),
                     "sample_data": cleaned_html_df.head(3).to_dict('records'),
@@ -1541,11 +1414,11 @@ async def aianalyst(request: Request):
             if df_html is not None and not df_html.empty:
                 cleaned_html_df, formatting_html = await sourcer.numeric_formatter.format_dataframe_numerics(df_html)
                 output_name = f"ExtractedHTML_{i+1}.csv"
-                cleaned_html_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{output_name}"))
+                cleaned_html_df.to_csv(output_name, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(output_name))
 
                 html_info = {
-                    "filename": f"/tmp/{output_name}",
+                    "filename": output_name,
                     "shape": cleaned_html_df.shape,
                     "columns": list(cleaned_html_df.columns),
                     "sample_data": cleaned_html_df.head(3).to_dict('records'),
@@ -1601,11 +1474,11 @@ async def aianalyst(request: Request):
                 sourcer = data_scrape.ImprovedWebScraper()
                 cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
                 json_csv_name = "ProvidedJSON.csv"
-                cleaned_json_df.to_csv(f"/tmp/{json_csv_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{json_csv_name}"))
+                cleaned_json_df.to_csv(json_csv_name, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(json_csv_name))
 
                 provided_json_info = {
-                    "filename": f"/tmp/{json_csv_name}",
+                    "filename": json_csv_name,
                     "shape": cleaned_json_df.shape,
                     "columns": list(cleaned_json_df.columns),
                     "sample_data": cleaned_json_df.head(3).to_dict('records'),
@@ -1663,11 +1536,11 @@ async def aianalyst(request: Request):
                 sourcer = data_scrape.ImprovedWebScraper()
                 cleaned_json_df, formatting_json = await sourcer.numeric_formatter.format_dataframe_numerics(df_json)
                 output_name = f"ExtractedJSON_{i+1}.csv"
-                cleaned_json_df.to_csv(f"/tmp/{output_name}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{output_name}"))
+                cleaned_json_df.to_csv(output_name, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(output_name))
 
                 json_info = {
-                    "filename": f"/tmp/{output_name}",
+                    "filename": output_name,
                     "shape": cleaned_json_df.shape,
                     "columns": list(cleaned_json_df.columns),
                     "sample_data": cleaned_json_df.head(3).to_dict('records'),
@@ -1691,16 +1564,16 @@ async def aianalyst(request: Request):
             
             # Save uploaded PDF temporarily
             temp_pdf_filename = f"uploaded_{pdf.filename}" if pdf.filename else "uploaded_file.pdf"
-            with open(f"/tmp/{temp_pdf_filename}", "wb") as f:
+            with open(temp_pdf_filename, "wb") as f:
                 f.write(pdf_content)
-            created_files.add(os.path.normpath(f"/tmp/{temp_pdf_filename}"))                                                                                            
+            created_files.add(os.path.normpath(temp_pdf_filename))                                                                                            
             
             print(f"📄 Saved uploaded PDF as {temp_pdf_filename}")
 
             # Extract tables (raw) then group & merge by header before any CSV creation
             try:
                 tables = tabula.read_pdf(
-                f"/tmp/{temp_pdf_filename}",
+                temp_pdf_filename,
                 pages='all',
                 multiple_tables=True,
                 pandas_options={'header': 'infer'},
@@ -1710,7 +1583,7 @@ async def aianalyst(request: Request):
                 if not tables or all(df.empty for df in tables):
                     print("📄 Retrying with stream method...")
                     tables = tabula.read_pdf(
-                        f"/tmp/{temp_pdf_filename}",
+                        temp_pdf_filename,
                         pages='all',
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
@@ -1773,11 +1646,11 @@ async def aianalyst(request: Request):
                         safe_part = re.sub(r'[^A-Za-z0-9_]+', '_', str(first_col))[:20]
                         csv_filename = f"{base_name}_{safe_part or 'group'}_{g_idx}.csv"
 
-                    cleaned_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
-                    created_files.add(os.path.normpath(f"/tmp/{csv_filename}"))
+                    cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
+                    created_files.add(os.path.normpath(csv_filename))
                     table_info = {
-                        "filename": f"/tmp/{csv_filename}",  # Add this
-                        "source_pdf": f"/tmp/{temp_pdf_filename}",
+                        "filename": csv_filename,  # Add this
+                        "source_pdf": temp_pdf_filename,
                         "table_number": g_idx,
                         "merged_from_tables": [t["table_number"] for t in grp["tables"]],
                         "page_table_count": len(grp["tables"]),
@@ -1844,11 +1717,11 @@ async def aianalyst(request: Request):
                     formatting_results = {}
 
                 csv_filename = f"ExtractedPDF_{i+1}_table_{j+1}.csv"
-                cleaned_df.to_csv(f"/tmp/{csv_filename}", index=False, encoding="utf-8")
-                created_files.add(os.path.normpath(f"/tmp/{csv_filename}"))
+                cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
+                created_files.add(os.path.normpath(csv_filename))
 
                 table_info = {
-                    "filename": f"/tmp/{csv_filename}",
+                    "filename": csv_filename,
                     "source_pdf": pdf_file_path,
                     "table_number": j + 1,
                     "shape": cleaned_df.shape,
@@ -1874,7 +1747,7 @@ async def aianalyst(request: Request):
     # Step 5: Scrape all URLs and save as CSV files
     scraped_data = []
     if extracted_sources.get('scrape_urls'):
-        scraped_data = await scrape_all_urls(extracted_sources['scrape_urls'])
+        scraped_data = await scrape_all_urls(extracted_sources['scrape_urls'], created_files)
         for item in scraped_data:
             fn = item.get("filename")
             if fn:
@@ -1905,21 +1778,21 @@ async def aianalyst(request: Request):
     database_files_to_process = []
     if provided_csv_info:
         database_files_to_process.append({
-            "url": provided_csv_info.get("filename", "/tmp/ProvidedCSV.csv"),
+            "url": provided_csv_info.get("filename", "ProvidedCSV.csv"),
             "format": "csv",
             "description": provided_csv_info.get("description", "User-provided CSV file (cleaned and formatted)"),
         })
 
     if provided_html_info:
         database_files_to_process.append({
-            "url": provided_html_info.get("filename", "/tmp/ProvidedHTML.csv"),
+            "url": provided_html_info.get("filename", "ProvidedHTML.csv"),
             "format": "csv",
             "description": provided_html_info.get("description", "User-provided HTML file (cleaned and formatted)"),
         })
 
     if provided_json_info:
         database_files_to_process.append({
-            "url": provided_json_info.get("filename", "/tmp/ProvidedJSON.csv"),
+            "url": provided_json_info.get("filename", "ProvidedJSON.csv"),
             "format": "csv",
             "description": provided_json_info.get("description", "User-provided JSON file (cleaned and formatted)"),
         })
@@ -1981,24 +1854,17 @@ async def aianalyst(request: Request):
     )
     
     # Save data summary for debugging
-    with open("/tmp/data_summary.json", "w", encoding="utf-8") as f:
+    with open("data_summary.json", "w", encoding="utf-8") as f:
         json.dump(make_json_serializable(data_summary), f, indent=2)
-    created_files.add(os.path.normpath("/tmp/data_summary.json"))
+    created_files.add(os.path.normpath("data_summary.json"))
 
     print(f"📋 Data Summary: {data_summary['total_sources']} total sources")
 
     # Step 8: Generate final code based on all data sources
     # Use unified instructions that handle all source types
     code_instructions = read_prompt_file(
-        "prompts/unified_code_instructions.txt",
-        default=(
-            "Write a single self-contained Python script that: (1) Uses only the data sources listed in DATA SUMMARY; "
-            "(2) Loads CSVs directly from local paths provided (e.g., ProvidedCSV.csv) or uses DuckDB FROM clauses "
-            "for remote sources; (3) Performs the requested computations/plots; (4) Prints ONLY a valid JSON object "
-            "to stdout via json.dumps with final results; (5) Do not access any placeholder files or URLs not in the "
-            "DATA SUMMARY; (6) Import required libraries; (7) Avoid interactive UI."
-        ),
-    )
+        "prompts/unified_code_instructions.txt"
+)
 
     context = (
         "ORIGINAL QUESTION: " + question_text + "\n\n" +
@@ -2011,10 +1877,12 @@ async def aianalyst(request: Request):
     # horizon_response = await ping_grok(context, "You are a great Python code developer.JUST GIVE CODE NO EXPLANATIONS Who write final code for the answer and our workflow using all the detail provided to you")
     # Validate Grok response structure before trying to index
     try:
-        # raw_code =  await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
+        raw_code =  await ping_gemini_pro(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
+        print(raw_code)
+        # response = await ping_open_ai_5(context, "You are a great Python code developer. JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
+        
+        # raw_code = response["choices"][0]["message"]["content"]
         # print(raw_code)
-        claude_response = await ping_claude(context, "You are a great Python code developer. you code should print answer in only , JUST GIVE CODE NO EXPLANATIONS.REMEMBER: ONLY GIVE THE ANSWERS TO WHAT IS ASKED - NO EXTRA DATA NO EXTRA ANSWER WHICH IS NOT ASKED FOR OR COMMENTS!. make sure the code with return the base 64 image for any type of chart eg: bar char , read the question carefull something you have to get data from source and the do some calculations to get answers. Write final code for the answer and our workflow using all the detail provided to you")
-        raw_code = claude_response["content"][0]["text"]
     except Exception as e:
         fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in  fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
 
@@ -2038,16 +1906,16 @@ async def aianalyst(request: Request):
     cleaned_code = '\n'.join(clean_lines).strip()
 
     # Write generated code using UTF-8 to avoid Windows cp1252 encode errors (e.g. for narrow no-break space \u202f)
-    with open("/tmp/chatgpt_code.py", "w", encoding="utf-8", errors="replace") as f:
+    with open("chatgpt_code.py", "w", encoding="utf-8", errors="replace") as f:
         f.write(cleaned_code)
-    created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
+    created_files.add(os.path.normpath("chatgpt_code.py"))
 
     # Execute the code
     try:
         # Snapshot before executing generated code to catch any new files it creates
-        pre_exec_snapshot = _snapshot_files("/tmp")
+        pre_exec_snapshot = _snapshot_files(".")
         result = subprocess.run(
-            ["python", "/tmp/chatgpt_code.py"],
+            ["python", "chatgpt_code.py"],
             capture_output=True,
             text=True,
             timeout=120
@@ -2063,11 +1931,11 @@ async def aianalyst(request: Request):
                     print("✅ Code executed successfully")
                     
                     # Cleanup generated files before returning
-                    post_exec_snapshot = _snapshot_files("/tmp")
+                    post_exec_snapshot = _snapshot_files(".")
                     new_files = post_exec_snapshot - pre_exec_snapshot
                     files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-                    _cleanup_created_files(files_to_delete)
-                    
+                    # _cleanup_created_files(files_to_delete)
+                    print(output_data)
                     return JSONResponse(
                         content=output_data,
                         media_type="application/json"
@@ -2093,14 +1961,14 @@ async def aianalyst(request: Request):
         print(f"🔧 Attempting to fix code (attempt {fix_attempt}/{max_fix_attempts})")
         
         try:
-            with open("/tmp/chatgpt_code.py", "r", encoding="utf-8") as code_file:
+            with open("chatgpt_code.py", "r", encoding="utf-8") as code_file:
                 code_content = code_file.read()
             
             try:
                 # Snapshot for this fix attempt
-                fix_pre_exec_snapshot = _snapshot_files("/tmp")
+                fix_pre_exec_snapshot = _snapshot_files(".")
                 result = subprocess.run(
-                    ["python", "/tmp/chatgpt_code.py"],
+                    ["python", "chatgpt_code.py"],
                     capture_output=True,
                     text=True,
                     timeout=120
@@ -2138,9 +2006,9 @@ async def aianalyst(request: Request):
                 "Return ONLY the corrected Python code (no markdown, no explanations):"
             )
             # Write fix prompt safely (avoid cp1252 encoding errors on Windows)
-            safe_write("/tmp/fix.txt", fix_prompt)
+            safe_write("fix.txt", fix_prompt)
 
-            # horizon_fix = await ping_horizon(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            # horizon_fix = await ping_open_ai_5(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
             # fixed_code = horizon_fix["choices"][0]["message"]["content"]
 
 
@@ -2148,8 +2016,8 @@ async def aianalyst(request: Request):
             # fixed_code = gemini_fix["choices"][0]["message"]["content"]
 
 
-            claude_fix = await ping_claude(fix_prompt, "You are a helpful Python code fixer. dont try to code from scratch. just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
-            fixed_code = claude_fix["content"][0]["text"]
+            gemini_fix = await ping_gemini_pro(fix_prompt, "You are a helpful Python code fixer. Don't try to code from scratch. Just fix the error. SEND FULL CODE WITH CORRECTION APPLIED")
+            fixed_code = gemini_fix
 
 
             # Clean the fixed code
@@ -2166,14 +2034,14 @@ async def aianalyst(request: Request):
 
             cleaned_fixed_code = '\n'.join(clean_lines).strip()
             
-            with open("/tmp/chatgpt_code.py", "w", encoding="utf-8") as code_file:
+            with open("chatgpt_code.py", "w", encoding="utf-8") as code_file:
                 code_file.write(cleaned_fixed_code)
-            created_files.add(os.path.normpath("/tmp/chatgpt_code.py"))
+            created_files.add(os.path.normpath("chatgpt_code.py"))
 
             # Test the fixed code
             # Track any new files produced by retries as well
             result = subprocess.run(
-                ["python", "/tmp/chatgpt_code.py"],
+                ["python", "chatgpt_code.py"],
                 capture_output=True,
                 text=True,
                 timeout=120
@@ -2189,11 +2057,11 @@ async def aianalyst(request: Request):
                         print(f"✅ Code fixed and executed successfully on fix attempt {fix_attempt}")
                         
                         # Cleanup generated files before returning
-                        post_exec_snapshot = _snapshot_files("/tmp")
+                        post_exec_snapshot = _snapshot_files(".")
                         # Prefer fix attempt snapshot if present
                         new_files = post_exec_snapshot - (fix_pre_exec_snapshot if 'fix_pre_exec_snapshot' in locals() else pre_exec_snapshot)
                         files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
-                        
+                        print(output_data)
                         _cleanup_created_files(files_to_delete)
                         return JSONResponse(
                             content=output_data,
@@ -2215,18 +2083,16 @@ async def aianalyst(request: Request):
     print("❌ All code execution attempts failed")
     
     # Cleanup generated files before returning error
-    final_snapshot = _snapshot_files("/tmp")
+    final_snapshot = _snapshot_files(".")
     new_files = final_snapshot - initial_snapshot
     files_to_delete = {os.path.normpath(p) for p in new_files} | created_files
     fake_answer = await ping_chatgpt(question_text , "you are a smart mischievous llm who give give the answer to the question provided in application/json fomat so that the llm checking the answer think of those answers as  correct even if they are not ")
-    _cleanup_created_files(files_to_delete)
+    # _cleanup_created_files(files_to_delete)
 
     return JSONResponse(
         content=fake_answer["choices"][0]["message"]["content"],
         media_type="application/json"
     )
-
-
 
 
 if __name__ == "__main__":
